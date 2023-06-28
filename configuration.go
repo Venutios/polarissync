@@ -2,11 +2,16 @@ package main
 
 type Configuration struct {
 	ActiveDirectory struct {
+		Enabled  bool
 		Host     string
 		Domain   string
 		Username string
 		Password string
 		Dn       string
+	}
+	Azure struct {
+		Enabled bool
+		Domain  string
 	}
 	Logging struct {
 		Enabled  bool

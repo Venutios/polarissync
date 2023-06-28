@@ -3,8 +3,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -31,6 +33,8 @@ func main() {
 
 	viper.SetDefault("logging.enabled", false)
 	viper.SetDefault("logging.location", ".")
+	viper.SetDefault("azure.enabled", false)
+	viper.SetDefault("activedirectory.enabled", true)
 	viper.SetDefault("activedirectory.host", "127.0.0.1")
 	viper.SetDefault("database.host", "127.0.0.1")
 	viper.SetDefault("database.port", 1433)
@@ -61,8 +65,14 @@ func main() {
 
 	writeInfo("Loading the list of computers from the database")
 	listDBComputers()
-	writeInfo("Loading the list of computers from Active Directory")
-	listADComputers()
+	if config.ActiveDirectory.Enabled {
+		writeInfo("Loading the list of computers from Active Directory")
+		listADComputers()
+	}
+	if config.Azure.Enabled {
+		writeInfo("Loading the list of computers from Azure")
+		listAzureComputers()
+	}
 	writeInfo("Searching for computers to remove from the database")
 	findComputersToRemoveFromDB()
 }
@@ -80,7 +90,7 @@ func writeError(err error) {
 	panic(err)
 }
 
-//Build the database connection string based on the config of a trusted connection, or specifying credentials
+// Build the database connection string based on the config of a trusted connection, or specifying credentials
 func buildConnString() string {
 	if config.Database.Trusted {
 		return fmt.Sprintf("server=%s;port=%d;database=%s;trusted_connection=yes", config.Database.Host, config.Database.Port, config.Database.Name)
@@ -90,7 +100,7 @@ func buildConnString() string {
 	}
 }
 
-//Populate the dbComputers slice with a list of computers names
+// Populate the dbComputers slice with a list of computers names
 func listDBComputers() {
 	conn, err := sql.Open("mssql", buildConnString())
 	if err != nil {
@@ -118,7 +128,7 @@ func listDBComputers() {
 	writeInfo(strconv.Itoa(len(dbComputers)) + " records retrieved")
 }
 
-//Populate the adComputers slice with a list of computers names
+// Populate the adComputers slice with a list of computers names
 func listADComputers() {
 	l, err := ldap.DialURL(fmt.Sprintf("ldap://%s:389", config.ActiveDirectory.Host))
 	if err != nil {
@@ -148,10 +158,71 @@ func listADComputers() {
 		writeError(fmt.Errorf("no results returned from ldap search"))
 	}
 
-	writeInfo(strconv.Itoa(len(adComputers)) + " records retrieved")
+	writeInfo(strconv.Itoa(len(adComputers)) + " records retrieved from AD")
 }
 
-//Looking for items in dcComputers that don't exist in adComputers and aren't exempt in the config
+// Add records for Azure joined machine to the adComputers slice
+func listAzureComputers() {
+	cmd := exec.Command("powershell", "-nologo", "-noprofile")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	go func() {
+		defer stdin.Close()
+		fmt.Fprintln(stdin, "$userName = '"+config.ActiveDirectory.Username+"@"+config.Azure.Domain+"'")
+		fmt.Fprintln(stdin, "$passText = '"+config.ActiveDirectory.Password+"'")
+		fmt.Fprintln(stdin, "$secpasswd = ConvertTo-SecureString -String $passText -AsPlainText -Force")
+		fmt.Fprintln(stdin, "$creds = New-Object System.Management.Automation.PSCredential ($userName, $secpasswd)")
+		fmt.Fprintln(stdin, "Connect-AzureAD -Credential $creds")
+		fmt.Fprintln(stdin, "Get-AzureADDevice -All $true | Where {($_.DeviceTrustType -eq \"AzureAD\") -and ($_.ProfileType -eq \"RegisteredDevice\")} | Format-Table -Property DisplayName")
+	}()
+
+	if err = cmd.Start(); err != nil {
+		writeError(fmt.Errorf("failed to connect to powershell: %w", err))
+	}
+
+	out, _ := io.ReadAll(stdout)
+	errtxt, _ := io.ReadAll(stderr)
+
+	if err = cmd.Wait(); err != nil {
+		writeError(fmt.Errorf("failed to retrieve records from Azure: %w\n%s", err, errtxt))
+	}
+
+	//parse the powershell output
+	psData := strings.Split(string(out[:]), "\r")
+	skip := true
+	count := 0
+	for _, c := range psData {
+		//Start of the computer records has been found, save each line until a blank line is encountered
+		if !skip {
+			trimmed := strings.TrimSpace((c))
+			if trimmed == "" {
+				break
+			}
+			adComputers = append(adComputers, strings.ToUpper(trimmed))
+			count++
+		} else {
+			//Check if this line is the dashes right above the list of computers
+			if strings.HasPrefix(strings.TrimSpace(c), "-----------") {
+				skip = false
+			}
+		}
+	}
+
+	writeInfo(strconv.Itoa(count) + " records retrieved from Azure")
+}
+
+// Looking for items in dcComputers that don't exist in adComputers and aren't exempt in the config
 func findComputersToRemoveFromDB() {
 	count := 0
 	for x := range dbComputers {
@@ -183,7 +254,7 @@ func findComputersToRemoveFromDB() {
 	writeInfo(strconv.Itoa(count) + " computers removed from database")
 }
 
-//Remove the record from the database
+// Remove the record from the database
 func removeComputer(name string) bool {
 	conn, err := sql.Open("mssql", buildConnString())
 	if err != nil {
