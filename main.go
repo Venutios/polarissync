@@ -17,13 +17,19 @@ import (
 	"github.com/spf13/viper"
 )
 
+type Organization struct {
+	OrganizationID int
+	Abbreviation   string
+}
+
 var (
-	config      Configuration
-	dbComputers []string
-	adComputers []string
-	logFile     *os.File
-	errorLogger *log.Logger
-	infoLogger  *log.Logger
+	config          Configuration
+	dbComputers     []string
+	adComputers     []string
+	dbOrganizations []Organization
+	logFile         *os.File
+	errorLogger     *log.Logger
+	infoLogger      *log.Logger
 )
 
 func main() {
@@ -63,6 +69,8 @@ func main() {
 		infoLogger = log.New(logFile, "INFO: ", log.Ldate|log.Ltime)
 	}
 
+	writeInfo("Loading the list of organizations from the database")
+	listDBOrganizations()
 	writeInfo("Loading the list of computers from the database")
 	listDBComputers()
 	if config.ActiveDirectory.Enabled {
@@ -75,6 +83,8 @@ func main() {
 	}
 	writeInfo("Searching for computers to remove from the database")
 	findComputersToRemoveFromDB()
+	writeInfo("Searching for computers to add to the database")
+	findComputersToAddToDB()
 }
 
 func writeInfo(msg string) {
@@ -268,6 +278,82 @@ func removeComputer(name string) bool {
 		return false
 	} else {
 		writeInfo(name + " removed from database")
+	}
+
+	return true
+}
+
+// Populate the dbOrganizations slice with a list of organization IDs and codes
+func listDBOrganizations() {
+	conn, err := sql.Open("mssql", buildConnString())
+	if err != nil {
+		writeError(fmt.Errorf("database connection failed: %w", err))
+	}
+	defer conn.Close()
+
+	rows, err := conn.Query("select OrganizationID, Abbreviation from Polaris.Organizations")
+	if err != nil {
+		writeError(fmt.Errorf("failed to load organizations: %w", err))
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var Org Organization
+		if err := rows.Scan(&Org.OrganizationID, &Org.Abbreviation); err != nil {
+			writeError(fmt.Errorf("error reading record from database: %w", err))
+		}
+		Org.Abbreviation = strings.ToUpper(Org.Abbreviation)
+		dbOrganizations = append(dbOrganizations, Org)
+	}
+	if err = rows.Err(); err != nil {
+		writeError(fmt.Errorf("error reading from database: %w", err))
+	}
+
+	writeInfo(strconv.Itoa(len(dbOrganizations)) + " records retrieved")
+}
+
+func findComputersToAddToDB() {
+	count := 0
+	for x := range adComputers {
+		found := false
+		for y := range dbComputers {
+			if adComputers[x] == dbComputers[y] {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			if addComputer(adComputers[x]) {
+				count++
+			}
+		}
+	}
+
+	writeInfo(strconv.Itoa(count) + " computers added to database")
+}
+
+// Add the record to the database
+func addComputer(name string) bool {
+	conn, err := sql.Open("mssql", buildConnString())
+	if err != nil {
+		writeError(fmt.Errorf("database connection failed: %w", err))
+	}
+	defer conn.Close()
+
+	orgID := 1
+	for i := range dbOrganizations {
+		if dbOrganizations[i].Abbreviation == name[0:2] {
+			orgID = dbOrganizations[i].OrganizationID
+		}
+	}
+
+	_, err = conn.Exec("insert into Polaris.Workstations(OrganizationID,DisplayName,ComputerName,CreatorID,CreationDate,Enabled,Status,LeapAllowed,TerminalServer) values (?,?,?,?,GETDATE(),?,?,?,?)", orgID, name, name, 1, 1, 0, 1, 0)
+	if err != nil {
+		writeInfo(fmt.Sprintf("Failed to add workstion %s: %s", name, err.Error()))
+		return false
+	} else {
+		writeInfo(name + " added to database")
 	}
 
 	return true
