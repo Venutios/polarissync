@@ -348,24 +348,20 @@ func addComputer(name string) bool {
 		}
 	}
 
-	dbResult, err := conn.Exec("insert into Polaris.Workstations(OrganizationID,DisplayName,ComputerName,CreatorID,CreationDate,Enabled,Status,LeapAllowed,TerminalServer) values (?,?,?,?,GETDATE(),?,?,?,?)", orgID, name, name, 1, 1, 0, 1, 0)
+	//For Polaris 7.5, add workstations to a workstations group. Retrieve the new ID
+	var workstationID int64
+	err = conn.QueryRow("insert into Polaris.Workstations(OrganizationID,DisplayName,ComputerName,CreatorID,CreationDate,Enabled,Status,LeapAllowed,TerminalServer) output inserted.WorkstationID values (?,?,?,?,GETDATE(),?,?,?,?)", orgID, name, name, 1, 1, 0, 1, 0).Scan(&workstationID)
 	if err != nil {
 		writeInfo(fmt.Sprintf("Failed to add workstation %s: %s", name, err.Error()))
 		return false
 	} else {
 		writeInfo(name + " added to database")
 
-		//For Polaris 7.5, add workstations to a workstations group
-		workstationID, err := dbResult.LastInsertId()
+		_, err := conn.Exec("insert into Polaris.GroupWorkstations(GroupID, WorkstationID) values (?,?)", 1, workstationID)
 		if err != nil {
-			writeInfo(fmt.Sprintf("Failed to retrieve id for workstation %s: %s", name, err.Error()))
+			writeInfo(fmt.Sprintf("Failed to add workstation %s with id %d to group: %s", name, workstationID, err.Error()))
 		} else {
-			_, err := conn.Exec("insert into Polaris.GroupWorkstations(GroupID, WorkstationID) values (?,?)", 1, workstationID)
-			if err != nil {
-				writeInfo(fmt.Sprintf("Failed to add workstation %s with id %d to group: %s", name, workstationID, err.Error()))
-			} else {
-				writeInfo(fmt.Sprintf("%s with id %d added to group workstations", name, workstationID))
-			}
+			writeInfo(fmt.Sprintf("%s with id %d added to group workstations", name, workstationID))
 		}
 	}
 
